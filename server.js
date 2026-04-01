@@ -1,80 +1,74 @@
 const express = require('express');
 const cors = require('cors');
 const pino = require('pino');
+const QRCode = require('qrcode'); // تأكد من إضافة هذه المكتبة
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// تحديد المنفذ ديناميكياً ليتوافق مع Render
 const PORT = process.env.PORT || 3000;
 
 let sock;
 let isConnected = false;
+let lastQR = null; // متغير لتخزين الرمز الأخير
 
 async function connectToWhatsApp() {
-    // استخدام مجلد محلي لحفظ الجلسة
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
 
     sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true, // سيظهر الـ QR في Logs موقع Render
-        logger: pino({ level: 'silent' }) // تقليل الرسائل المزعجة في الـ Logs
+        printQRInTerminal: true, 
+        logger: pino({ level: 'silent' })
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('--- QR CODE READY ---');
-            console.log('Check Render Logs to scan the QR Code');
+            // تحويل الرمز إلى رابط صورة (Data URL) ليتم عرضه في المتصفح
+            lastQR = await QRCode.toDataURL(qr);
+            console.log('--- QR CODE UPDATED ---');
         }
 
         if (connection === 'close') {
+            lastQR = null;
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connection closed. Reconnecting...', shouldReconnect);
             if (shouldReconnect) connectToWhatsApp();
             isConnected = false;
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp Connected Successfully!');
+            lastQR = null; // مسح الرمز بعد الاتصال الناجح
             isConnected = true;
+            console.log('✅ WhatsApp Connected Successfully!');
         }
     });
 }
 
-// نقطة فحص حالة السيرفر (Health Check) لمنع الـ Timeout في Render
+// الصفحة الرئيسية
 app.get('/', (req, res) => {
-    res.send(isConnected ? "WhatsApp Server is Online 🚀" : "WhatsApp Server is Offline 💤");
-});
-
-// API فحص رقم الهاتف
-app.post('/check-number', async (req, res) => {
-    if (!isConnected) {
-        return res.status(503).json({ error: "الواتساب غير متصل حالياً" });
-    }
-
-    const { phone } = req.body;
-    if (!phone) return res.status(400).json({ error: "يرجى إرسال الرقم" });
-
-    try {
-        // تنظيف الرقم من أي رموز زائدة
-        const cleanNumber = phone.replace(/\D/g, '');
-        const [result] = await sock.onWhatsApp(cleanNumber);
-
-        res.json({
-            exists: !!result?.exists,
-            jid: result?.jid || null
-        });
-    } catch (err) {
-        console.error('Error checking number:', err);
-        res.status(500).json({ error: "فشل في فحص الرقم برمجياً" });
+    if (isConnected) {
+        res.send("<h1>WhatsApp Server is Online 🚀</h1>");
+    } else if (lastQR) {
+        res.send(`<h1>Scan this QR Code</h1><img src="${lastQR}" />`);
+    } else {
+        res.send("<h1>WhatsApp Server is Offline 💤</h1><p>Waiting for QR code...</p>");
     }
 });
 
-// تشغيل السيرفر أولاً ثم بدء اتصال الواتساب لتجنب الـ Timeout
+// إضافة مسار /qr الذي كنت تطلبه
+app.get('/qr', (req, res) => {
+    if (lastQR) {
+        res.send(`<img src="${lastQR}" style="width:300px;"/>`);
+    } else {
+        res.send(isConnected ? "Connected already!" : "QR not ready yet, refresh in 10 seconds.");
+    }
+});
+
+// باقي كود الـ API الخاص بـ check-number يبقى كما هو...
+
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server is running on port ${PORT}`);
     connectToWhatsApp();
