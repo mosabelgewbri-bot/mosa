@@ -1,62 +1,81 @@
 const express = require('express');
 const cors = require('cors');
-const { default: makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
+const pino = require('pino');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// تحديد المنفذ ديناميكياً ليتوافق مع Render
+const PORT = process.env.PORT || 3000;
+
 let sock;
+let isConnected = false;
 
-// مسار الصحة للتأكد من عمل السيرفر (مهم لـ Render)
-app.get('/health', (req, res) => {
-    res.json({ status: "online", connected: !!sock });
-});
-
-// دالة الاتصال بالواتساب
-async function connectToWA() {
+async function connectToWhatsApp() {
+    // استخدام مجلد محلي لحفظ الجلسة
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
-    sock = makeWASocket({ 
-        auth: state, 
-        printQRInTerminal: true,
-        browser: ['Dar Al-Maqam Checker', 'Chrome', '1.0.0']
+
+    sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: true, // سيظهر الـ QR في Logs موقع Render
+        logger: pino({ level: 'silent' }) // تقليل الرسائل المزعجة في الـ Logs
     });
-    
+
     sock.ev.on('creds.update', saveCreds);
-    
+
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
+
         if (qr) {
-            console.log('QR Code generated. Please scan it in your terminal.');
+            console.log('--- QR CODE READY ---');
+            console.log('Check Render Logs to scan the QR Code');
         }
+
         if (connection === 'close') {
-            console.log('Connection closed. Reconnecting...');
-            connectToWA();
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log('Connection closed. Reconnecting...', shouldReconnect);
+            if (shouldReconnect) connectToWhatsApp();
+            isConnected = false;
         } else if (connection === 'open') {
-            console.log('WhatsApp Connected Successfully!');
+            console.log('✅ WhatsApp Connected Successfully!');
+            isConnected = true;
         }
     });
 }
 
-// نقطة النهاية لفحص الرقم
+// نقطة فحص حالة السيرفر (Health Check) لمنع الـ Timeout في Render
+app.get('/', (req, res) => {
+    res.send(isConnected ? "WhatsApp Server is Online 🚀" : "WhatsApp Server is Offline 💤");
+});
+
+// API فحص رقم الهاتف
 app.post('/check-number', async (req, res) => {
+    if (!isConnected) {
+        return res.status(503).json({ error: "الواتساب غير متصل حالياً" });
+    }
+
     const { phone } = req.body;
-    if (!sock) return res.status(500).json({ error: "الواتساب غير متصل" });
+    if (!phone) return res.status(400).json({ error: "يرجى إرسال الرقم" });
 
     try {
-        const [result] = await sock.onWhatsApp(phone);
-        res.json({ 
-            exists: result?.exists || false,
-            jid: result?.jid || null 
+        // تنظيف الرقم من أي رموز زائدة
+        const cleanNumber = phone.replace(/\D/g, '');
+        const [result] = await sock.onWhatsApp(cleanNumber);
+
+        res.json({
+            exists: !!result?.exists,
+            jid: result?.jid || null
         });
     } catch (err) {
-        console.error("Check error:", err);
-        res.status(500).json({ error: "فشل الفحص" });
+        console.error('Error checking number:', err);
+        res.status(500).json({ error: "فشل في فحص الرقم برمجياً" });
     }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    connectToWA();
+// تشغيل السيرفر أولاً ثم بدء اتصال الواتساب لتجنب الـ Timeout
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
+    connectToWhatsApp();
 });
